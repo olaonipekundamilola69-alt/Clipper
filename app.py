@@ -9,6 +9,7 @@ Needs: Python 3.9+, ffmpeg + ffprobe on PATH, and `pip install -r requirements.t
 Only use it on videos you own or have permission to use.
 """
 import array
+import gc
 import hmac
 import io
 import ipaddress
@@ -40,6 +41,13 @@ PASSWORD = os.environ.get("CLIPPER_PASSWORD", "")   # set this when hosting onli
 KEEP_HOURS = 6                                       # old videos and clips are deleted after this
 MAX_DIRECT_BYTES = 2 * 1024 ** 3                     # 2 GB cap for direct links
 
+# Lite mode keeps memory and CPU low for small servers (switched on automatically on Render).
+LITE = os.environ.get("CLIPPER_LITE", "1" if os.environ.get("RENDER") else "0") == "1"
+OUT_W = 720 if LITE else 1080          # width of vertical/square clips
+OUT_H = OUT_W * 16 // 9
+SHORT_SIDE_CAP = 720 if LITE else 1080  # bigger videos are shrunk to this when loaded
+HEAVY = threading.Semaphore(1)          # only one heavy job (render, transcribe, convert) at a time
+
 app = Flask(__name__)
 app.config["MAX_CONTENT_LENGTH"] = 4 * 1024 ** 3
 
@@ -49,7 +57,6 @@ ID_RE = re.compile(r"^[0-9a-f]{32}$")
 CLIP_RE = re.compile(r"^clip_[0-9a-f]{8}\.(mp4|jpg|srt)$")
 MP4_RE = re.compile(r"^clip_[0-9a-f]{8}\.mp4$")
 whisper_lock = threading.Lock()
-_model = None
 
 
 # ======================================================================
@@ -81,7 +88,10 @@ def start_task(fn, *args):
 
     def runner():
         try:
-            result = fn(TASKS[tid], *args)
+            TASKS[tid]["message"] = "Waiting for your other job to finish..."
+            with HEAVY:
+                TASKS[tid]["message"] = "Starting..."
+                result = fn(TASKS[tid], *args)
             TASKS[tid].update(status="done", progress=1.0, result=result)
         except Exception as e:  # shown to the user
             TASKS[tid].update(status="error", message=str(e))
@@ -191,13 +201,27 @@ def download_platform(url, d):
         ydl.download([url])
 
 
+def video_codec(path):
+    return run(["ffprobe", "-v", "error", "-select_streams", "v:0", "-show_entries", "stream=codec_name",
+                "-of", "csv=p=0", str(path)]).strip()
+
+
 def make_browser_friendly(d):
+    """Convert once on load if the video will not play in a browser, or is bigger than this server can handle."""
     src = source_file(d)
-    if src.suffix.lower() in BROWSER_OK:
+    _, w, h, _ = probe(src)
+    too_big = min(w, h) > SHORT_SIDE_CAP
+    ok_format = src.suffix.lower() in BROWSER_OK and video_codec(src) in ("h264", "vp8", "vp9")
+    if ok_format and not too_big:
         return src
+    scale = []
+    if too_big:
+        scale = ["-vf", f"scale={SHORT_SIDE_CAP}:-2" if w < h else f"scale=-2:{SHORT_SIDE_CAP}"]
     tmp = d / "converted.mp4"
-    run(["ffmpeg", "-y", "-i", str(src), "-c:v", "libx264", "-preset", "veryfast",
-         "-c:a", "aac", "-movflags", "+faststart", str(tmp)])
+    with HEAVY:
+        run(["ffmpeg", "-y", "-i", str(src)] + scale + [
+            "-c:v", "libx264", "-preset", "ultrafast", "-crf", "26", "-pix_fmt", "yuv420p",
+            "-c:a", "aac", "-b:a", "128k", "-threads", "2", "-movflags", "+faststart", str(tmp)])
     src.unlink()
     tmp.rename(d / "source.mp4")
     return d / "source.mp4"
@@ -207,33 +231,48 @@ def make_browser_friendly(d):
 # speech to text (faster-whisper) with a per-video cache
 # ======================================================================
 def whisper_available():
-    try:
-        import faster_whisper  # noqa: F401
-        return True
-    except ImportError:
-        return False
+    import importlib.util  # checks without importing, so the web process stays small
+    return importlib.util.find_spec("faster_whisper") is not None
+
+
+def _whisper_worker(wav, language, out_path):
+    """Runs in its own short-lived process so all of its memory is freed when it ends."""
+    from faster_whisper import WhisperModel
+    model = WhisperModel(os.environ.get("WHISPER_MODEL", "base"), device="cpu", compute_type="int8", cpu_threads=2)
+    segments, info = model.transcribe(wav, language=language or None, word_timestamps=True, vad_filter=True)
+    total = float(getattr(info, "duration", 0) or 0) or 1.0
+    words = []
+    for seg in segments:
+        for w in (seg.words or []):
+            t = w.word.strip()
+            if t:
+                words.append((float(w.start), float(w.end), t))
+        print("PROGRESS", min(1.0, float(seg.end) / total), flush=True)
+    with open(out_path, "w") as f:
+        json.dump(words, f)
 
 
 def transcribe(wav_path, language, progress=None, total=None):
     """Return a list of (start, end, word)."""
-    global _model
-    try:
-        from faster_whisper import WhisperModel
-    except ImportError:
+    if not whisper_available():
         raise RuntimeError("Captions need faster-whisper. Run: pip install faster-whisper")
+    out = Path(str(wav_path) + ".json")
+    tail = []
     with whisper_lock:
-        if _model is None:
-            _model = WhisperModel(os.environ.get("WHISPER_MODEL", "base"), device="cpu", compute_type="int8")
-        segments, _ = _model.transcribe(str(wav_path), language=language or None,
-                                        word_timestamps=True, vad_filter=True)
-        words = []
-        for seg in segments:
-            for w in (seg.words or []):
-                t = w.word.strip()
-                if t:
-                    words.append((float(w.start), float(w.end), t))
-            if progress and total:
-                progress(min(1.0, float(seg.end) / total))
+        p = subprocess.Popen([sys.executable, str(Path(__file__).resolve()), "--whisper", str(wav_path),
+                              language or "", str(out)], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+        for line in p.stdout:
+            if line.startswith("PROGRESS"):
+                if progress:
+                    progress(float(line.split()[1]))
+            else:
+                tail = (tail + [line.strip()])[-5:]
+        p.wait()
+    if p.returncode != 0 or not out.exists():
+        detail = next((t for t in reversed(tail) if t), "no details")
+        raise RuntimeError(f"Speech recognition failed ({detail}). On a small server, set WHISPER_MODEL to tiny.")
+    words = [tuple(w) for w in json.loads(out.read_text())]
+    out.unlink(missing_ok=True)
     return words
 
 
@@ -279,16 +318,22 @@ NUM = re.compile(r"\b\d[\d,.%]*\b")
 
 
 def energy_series(path):
-    """Loudness (RMS) for each second of audio."""
-    p = subprocess.run(["ffmpeg", "-v", "error", "-i", str(path), "-vn", "-ac", "1",
-                        "-ar", "8000", "-f", "s16le", "-"], capture_output=True)
-    if p.returncode != 0 or not p.stdout:
-        return []
-    samples = array.array("h")
-    samples.frombytes(p.stdout[: len(p.stdout) // 2 * 2])
-    per = 8000
-    return [math.sqrt(sum(x * x for x in samples[s * per:(s + 1) * per]) / per)
-            for s in range(len(samples) // per)]
+    """Loudness (RMS) for each second of audio, read as a stream so memory stays small."""
+    proc = subprocess.Popen(["ffmpeg", "-v", "error", "-i", str(path), "-vn", "-ac", "1", "-ar", "8000",
+                             "-f", "s16le", "-"], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+    per_sec, out, buf = 16000, [], b""   # 8000 samples x 2 bytes
+    while True:
+        chunk = proc.stdout.read(per_sec * 4)
+        if not chunk:
+            break
+        buf += chunk
+        while len(buf) >= per_sec:
+            a = array.array("h")
+            a.frombytes(buf[:per_sec])
+            buf = buf[per_sec:]
+            out.append(math.sqrt(sum(x * x for x in a) / 8000))
+    proc.wait()
+    return out
 
 
 def scene_times(path):
@@ -581,17 +626,18 @@ LOOKS = {
 DEFAULT_EXTRAS = dict(hook=True, bar=True, zoom=True, grade=True, fade=True, audio=True)
 ZOOM = 0.06
 
-FORMAT_SIZE = {"original": None, "vertical": (1080, 1920), "vertical_blur": (1080, 1920), "square": (1080, 1080)}
+FORMAT_SIZE = {"original": None, "vertical": (OUT_W, OUT_H), "vertical_blur": (OUT_W, OUT_H), "square": (OUT_W, OUT_W)}
 CAPTION_MARGIN = {"original": 0.08, "vertical": 0.22, "vertical_blur": 0.22, "square": 0.08}
 BASE_FILTERS = {
     "original": "scale=trunc(iw/2)*2:trunc(ih/2)*2",
-    "vertical": "scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920",
-    "square": "scale=1080:1080:force_original_aspect_ratio=increase,crop=1080:1080",
+    "vertical": f"scale={OUT_W}:{OUT_H}:force_original_aspect_ratio=increase,crop={OUT_W}:{OUT_H}",
+    "square": f"scale={OUT_W}:{OUT_W}:force_original_aspect_ratio=increase,crop={OUT_W}:{OUT_W}",
 }
+_BW, _BH = OUT_W // 5, OUT_H // 5
 BLUR_BASE = (
     "[0:v]split[a][b];"
-    "[a]scale=216:384:force_original_aspect_ratio=increase,crop=216:384,boxblur=6,scale=1080:1920[bg];"
-    "[b]scale=1080:1920:force_original_aspect_ratio=decrease[fg];"
+    f"[a]scale={_BW}:{_BH}:force_original_aspect_ratio=increase,crop={_BW}:{_BH},boxblur=6,scale={OUT_W}:{OUT_H}[bg];"
+    f"[b]scale={OUT_W}:{OUT_H}:force_original_aspect_ratio=decrease[fg];"
     "[bg][fg]overlay=(W-w)/2:(H-h)/2,setsar=1"
 )
 
@@ -739,7 +785,7 @@ def make_clip(d, start, end, fmt, captions, language, look, hook, extras, waterm
         cmd += ["-map", "0:a"] + (["-filter:a", ",".join(af)] if af else []) + ["-c:a", "aac", "-b:a", "160k"]
     else:
         cmd += ["-an"]
-    cmd += ["-c:v", "libx264", "-preset", "veryfast", "-crf", "20", "-pix_fmt", "yuv420p",
+    cmd += ["-c:v", "libx264", "-preset", "veryfast", "-crf", "21", "-pix_fmt", "yuv420p", "-threads", "2",
             "-movflags", "+faststart", str(d / name)]
     run(cmd, cwd=str(d))  # cwd lets the subtitles filter find the caption file by its short name
     if ass_name:
@@ -1411,6 +1457,9 @@ def lan_ip():
 
 
 if __name__ == "__main__":
+    if len(sys.argv) >= 5 and sys.argv[1] == "--whisper":
+        _whisper_worker(sys.argv[2], sys.argv[3], sys.argv[4])
+        sys.exit(0)
     port = int(os.environ.get("PORT", 5000))
     if "--phone" in sys.argv:
         print("\nOn your phone (same Wi-Fi as this computer), open:")
